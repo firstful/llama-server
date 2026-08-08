@@ -37,7 +37,7 @@ FROM archlinux:latest AS runtime
 RUN pacman -Syu --noconfirm --needed \
         mesa vulkan-icd-loader ca-certificates \
     && rm -rf /var/cache/pacman/pkg
-COPY --from=builder /src/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /src/build/bin/ /usr/local/bin/
 # RADV ICD shipped by mesa: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 EXPOSE 8080

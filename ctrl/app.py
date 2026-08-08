@@ -181,6 +181,7 @@ async def sleep():
 
 
 @app.get("/v1/models")
+@app.get("/models")  # alias: the llm-gateway probes {base_url}/models
 async def v1_models():
     """Static model list — NEVER wakes the server for a listing."""
     return {

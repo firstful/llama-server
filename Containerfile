@@ -38,6 +38,10 @@ RUN pacman -Syu --noconfirm --needed \
         mesa vulkan-icd-loader ca-certificates \
     && rm -rf /var/cache/pacman/pkg
 COPY --from=builder /src/build/bin/ /usr/local/bin/
+# llama.cpp's shared libs land next to the binary (build/bin) — that dir is
+# NOT in the default linker path, so the loader must be told explicitly or
+# llama-server dies with "error while loading shared libraries".
+ENV LD_LIBRARY_PATH=/usr/local/bin
 # RADV ICD shipped by mesa: /usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 EXPOSE 8080

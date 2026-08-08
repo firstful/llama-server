@@ -221,21 +221,36 @@ async def proxy(path: str, request: Request):
         last_err: Exception | None = None
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(
+                # NOTE: do NOT use `async with httpx.AsyncClient(...)` here —
+                # the context manager closes the client as soon as `return`
+                # runs, but StreamingResponse consumes the body LATER → the
+                # stream is already closed → 200 with 0 bytes. Keep the client
+                # alive and close it from the generator's finally instead.
+                client = httpx.AsyncClient(
                     timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None)
-                ) as c:
-                    req = c.build_request(request.method, url, headers=headers, content=body)
-                    r = await c.send(req, stream=True)
-                    if r.status_code in (502, 503, 504) and attempt < 2:
+                )
+                req = client.build_request(request.method, url, headers=headers, content=body)
+                r = await client.send(req, stream=True)
+                if r.status_code in (502, 503, 504) and attempt < 2:
+                    await r.aclose()
+                    await client.aclose()
+                    await asyncio.sleep(1.5)
+                    continue
+                ctype = r.headers.get("content-type")
+
+                async def _stream():
+                    try:
+                        async for chunk in r.aiter_raw():
+                            yield chunk
+                    finally:
                         await r.aclose()
-                        await asyncio.sleep(1.5)
-                        continue
-                    ctype = r.headers.get("content-type")
-                    return StreamingResponse(
-                        r.aiter_raw(),
-                        status_code=r.status_code,
-                        media_type=ctype,
-                    )
+                        await client.aclose()
+
+                return StreamingResponse(
+                    _stream(),
+                    status_code=r.status_code,
+                    media_type=ctype,
+                )
             except httpx.TransportError as e:
                 last_err = e
                 if attempt < 2:

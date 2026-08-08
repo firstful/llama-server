@@ -15,7 +15,7 @@
 FROM archlinux:latest AS builder
 ARG LLAMACPP_COMMIT=3653e6d6d547ec763317d9ecd0ace334a7e21359
 RUN pacman -Syu --noconfirm --needed \
-        base-devel cmake git shaderc vulkan-headers curl \
+        base-devel cmake git shaderc vulkan-headers vulkan-icd-loader curl \
     && rm -rf /var/cache/pacman/pkg
 WORKDIR /src
 # Pin the exact commit Reed benchmarked (3653e6d, 2026-08-07). Master is

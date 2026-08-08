@@ -57,8 +57,16 @@ async def _api() -> httpx.AsyncClient:
             token = f.read().strip()
         with open(f"{_SA_DIR}/ca.crt", "rb") as f:
             ca = f.read()
+        # httpx verify= wants a FILE PATH, not raw CA bytes (bytes breaks the
+        # SSL context setup with "'bytes' object has no attribute
+        # 'set_alpn_protocols'") — write the SA CA to a temp file once.
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as tf:
+            tf.write(ca)
+            ca_path = tf.name
         _k8s = httpx.AsyncClient(
-            verify=ca, timeout=10.0, headers={"Authorization": f"Bearer {token}"}
+            verify=ca_path, timeout=10.0, headers={"Authorization": f"Bearer {token}"}
         )
     return _k8s
 

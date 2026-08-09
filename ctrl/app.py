@@ -8,6 +8,10 @@ Idle-cooldown design:
   - every proxied request touches the idle clock; when in-flight is 0 AND no
     request has arrived for IDLE_TIMEOUT seconds, scales back to 0
 
+v1.1.0: while the server is sleeping/warming, a streaming chat request gets an
+LLM-voiced 'warming up...' preamble streamed immediately, then the real answer
+is spliced in when the GPU is ready — no more silent 90-120s freeze.
+
 Flux is configured (apps Kustomization `ignore` rule) to NOT manage
 spec.replicas on the llama-server Deployment, so scale calls stick.
 
@@ -16,6 +20,7 @@ domain as the llm gateway.
 """
 
 import asyncio
+import json
 import os
 import time
 
@@ -23,7 +28,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 NS = os.environ.get("LLAMA_NAMESPACE", "llama")
 DEPLOYMENT = os.environ.get("LLAMA_DEPLOYMENT", "llama-server")
@@ -94,11 +99,16 @@ async def _deployment_state() -> tuple[int, int]:
 
 
 async def _wake() -> None:
-    """Scale up and wait until ready. Idempotent; concurrent callers share one wake."""
-    if state["value"] == "ready":
+    """Scale up and wait until ready. Idempotent; concurrent callers share one
+    wake. Trusts the LIVE deployment over the in-memory state — if the server
+    is down (manual scale, Flux drift) we re-scale even when state says ready,
+    so a stale 'ready' can't deadlock wake."""
+    _, ready = await _deployment_state()
+    if state["value"] == "ready" and ready >= 1:
         return
     async with _wake_lock:
-        if state["value"] == "ready":
+        _, ready = await _deployment_state()
+        if state["value"] == "ready" and ready >= 1:
             return
         await _scale(1)
         state["value"] = "warming"
@@ -197,38 +207,93 @@ async def v1_models():
     }
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy(path: str, request: Request):
-    if path == "models":
-        return await v1_models()
-    try:
-        await _wake()
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"message": f"llama-server wake failed: {e}", "type": "server_error", "code": None}},
-        )
+def _sse(obj: dict) -> bytes:
+    """One OpenAI-style SSE data frame."""
+    return f"data: {json.dumps(obj)}\n\n".encode()
 
-    global _inflight, _last_request
-    _inflight += 1
-    _last_request = time.time()
-    try:
-        body = await request.body()
+
+async def _proxy_through(path: str, request: Request, body: bytes):
+    """Plain upstream proxy (server already up). Returns a StreamingResponse
+    that owns its httpx client (closed from the generator's finally)."""
+    headers = {k: v for k, v in request.headers.items() if k.lower() in _PROXY_HEADERS}
+    url = f"{UPSTREAM}/v1/{path}"
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            # NOTE: do NOT use `async with httpx.AsyncClient(...)` here — the
+            # context manager closes the client as soon as `return` runs, but
+            # StreamingResponse consumes the body LATER → the stream is already
+            # closed → 200 with 0 bytes. Keep the client alive and close it
+            # from the generator's finally instead.
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None)
+            )
+            req = client.build_request(request.method, url, headers=headers, content=body)
+            r = await client.send(req, stream=True)
+            if r.status_code in (502, 503, 504) and attempt < 2:
+                await r.aclose()
+                await client.aclose()
+                await asyncio.sleep(1.5)
+                continue
+            ctype = r.headers.get("content-type")
+
+            async def _stream():
+                try:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+                finally:
+                    await r.aclose()
+                    await client.aclose()
+
+            return StreamingResponse(
+                _stream(),
+                status_code=r.status_code,
+                media_type=ctype,
+            )
+        except httpx.TransportError as e:
+            last_err = e
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+                continue
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"message": f"llama-server unreachable: {last_err}", "type": "server_error", "code": None}},
+    )
+
+
+async def _warm_stream_response(path: str, request: Request, body: bytes):
+    """Stream an LLM-voiced 'warming up...' while the GPU spins up, then the
+    real answer — one continuous SSE response. The client sees progress
+    instead of silence during the 90-120s cold wake."""
+    wake_task = asyncio.create_task(_wake())
+
+    async def _gen():
+        # 1. immediately — the wrapper talks like the model
+        yield _sse({
+            "choices": [{"delta": {"role": "assistant", "content": "warming up..."}, "index": 0, "finish_reason": None}]
+        })
+        # 2. wait for the GPU to come up (wake keeps running if we time out)
+        try:
+            await asyncio.wait_for(asyncio.shield(wake_task), timeout=WAKE_TIMEOUT + 30)
+        except Exception as e:  # noqa: BLE001
+            yield _sse({
+                "choices": [{"delta": {"content": f"\n\n(local GPU failed to wake: {e})"}, "index": 0, "finish_reason": None}]
+            })
+            yield b"data: [DONE]\n\n"
+            return
+        # 3. splice the real upstream stream
         headers = {k: v for k, v in request.headers.items() if k.lower() in _PROXY_HEADERS}
         url = f"{UPSTREAM}/v1/{path}"
-        # small retry loop: right after readiness the Service endpoints can lag
-        # a beat -> connection refused / 502. Only 3 attempts, 1.5s apart.
         last_err: Exception | None = None
         for attempt in range(3):
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None)
+            )
             try:
-                # NOTE: do NOT use `async with httpx.AsyncClient(...)` here —
-                # the context manager closes the client as soon as `return`
-                # runs, but StreamingResponse consumes the body LATER → the
-                # stream is already closed → 200 with 0 bytes. Keep the client
-                # alive and close it from the generator's finally instead.
-                client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None)
-                )
                 req = client.build_request(request.method, url, headers=headers, content=body)
                 r = await client.send(req, stream=True)
                 if r.status_code in (502, 503, 504) and attempt < 2:
@@ -236,30 +301,63 @@ async def proxy(path: str, request: Request):
                     await client.aclose()
                     await asyncio.sleep(1.5)
                     continue
-                ctype = r.headers.get("content-type")
-
-                async def _stream():
-                    try:
-                        async for chunk in r.aiter_raw():
-                            yield chunk
-                    finally:
-                        await r.aclose()
-                        await client.aclose()
-
-                return StreamingResponse(
-                    _stream(),
-                    status_code=r.status_code,
-                    media_type=ctype,
-                )
+                try:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+                finally:
+                    await r.aclose()
+                    await client.aclose()
+                return
             except httpx.TransportError as e:
                 last_err = e
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
                 if attempt < 2:
                     await asyncio.sleep(1.5)
                     continue
-        return JSONResponse(
-            status_code=502,
-            content={"error": {"message": f"llama-server unreachable: {last_err}", "type": "server_error", "code": None}},
-        )
+        yield _sse({
+            "choices": [{"delta": {"content": f"\n\n(local GPU unreachable: {last_err})"}, "index": 0, "finish_reason": None}]
+        })
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy(path: str, request: Request):
+    if path == "models":
+        return await v1_models()
+
+    body = await request.body()
+    # only streaming chat requests get the in-stream warming preamble — a
+    # non-streaming client has no stream to show it in (it just blocks on wake).
+    wants_stream = False
+    if path == "chat/completions" and request.method == "POST":
+        try:
+            wants_stream = bool(json.loads(body).get("stream"))
+        except Exception:
+            wants_stream = False
+    # trust the LIVE deployment, not just the in-memory state: if the server
+    # is down (manual scale / drift) we must wake even when state says ready.
+    _, ready = await _deployment_state()
+    need_wake = ready < 1
+
+    global _inflight, _last_request
+    _inflight += 1
+    _last_request = time.time()
+    try:
+        if need_wake and wants_stream:
+            return await _warm_stream_response(path, request, body)
+        try:
+            await _wake()
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"llama-server wake failed: {e}", "type": "server_error", "code": None}},
+            )
+        return await _proxy_through(path, request, body)
     finally:
         _inflight -= 1
         _last_request = time.time()

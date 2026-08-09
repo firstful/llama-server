@@ -28,7 +28,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 NS = os.environ.get("LLAMA_NAMESPACE", "llama")
 DEPLOYMENT = os.environ.get("LLAMA_DEPLOYMENT", "llama-server")
@@ -276,10 +276,19 @@ async def _warm_stream_response(path: str, request: Request, body: bytes):
         yield _sse({
             "choices": [{"delta": {"role": "assistant", "content": "warming up..."}, "index": 0, "finish_reason": None}]
         })
-        # 2. wait for the GPU to come up (wake keeps running if we time out)
+        # 2. wait for the GPU to come up (wake keeps running if we time out).
+        #    Emit SSE COMMENT frames (: keepalive) every 15s while waiting —
+        #    invisible to SSE clients but they count as bytes, so Cloudflare's
+        #    fixed 100s tunnel timeout can't kill the idle stream mid-wake
+        #    (observed 2026-08-09: browser got 'network error' at ~100s).
         try:
-            await asyncio.wait_for(asyncio.shield(wake_task), timeout=WAKE_TIMEOUT + 30)
-        except Exception as e:  # noqa: BLE001
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.shield(wake_task), timeout=15)
+                    break  # wake completed without error
+                except asyncio.TimeoutError:
+                    yield b": keepalive\n\n"
+        except Exception as e:  # noqa: BLE001 — wake_task raised
             yield _sse({
                 "choices": [{"delta": {"content": f"\n\n(local GPU failed to wake: {e})"}, "index": 0, "finish_reason": None}]
             })
